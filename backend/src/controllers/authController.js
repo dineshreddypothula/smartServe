@@ -8,22 +8,21 @@ const isValidEmail = (email) => {
   return re.test(email);
 };
 
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) throw new Error('JWT_SECRET environment variable is required');
+
 export const generateToken = (id, roles) => {
-  return jwt.sign({ id, roles }, process.env.JWT_SECRET || "default_secret_key", {
+  return jwt.sign({ id, roles }, JWT_SECRET, {
     expiresIn: "1d",
   });
 };
 
 export const setTokenCookie = (res, token) => {
   const isProduction = process.env.NODE_ENV === "production";
-  const isDev = process.env.NODE_ENV === "development";
-
-  // For cross-site cookies (Render to Netlify/Localhost), we NEED sameSite: "none" and secure: true
-  // Even in development, if we are hitting a remote backend, we need these.
   res.cookie("jwt", token, {
     httpOnly: true,
-    secure: true, // Required for sameSite: "none"
-    sameSite: "none",
+    secure: isProduction,
+    sameSite: isProduction ? "none" : "lax",
     maxAge: 24 * 60 * 60 * 1000, // 1 day
   });
 };
@@ -33,7 +32,6 @@ export const registerUser = async (req, res) => {
   try {
     const { name, email, password, role } = req.body;
 
-    // Validate input
     if (!name || !email || !password) {
       return res.status(400).json({ message: "All fields are required" });
     }
@@ -46,23 +44,17 @@ export const registerUser = async (req, res) => {
       return res.status(400).json({ message: "Password must be at least 6 characters long" });
     }
 
-    // Check if user already exists
     const existingUser = await User.findOne({ email });
     if (existingUser) {
       return res.status(400).json({ message: "User already exists" });
     }
 
-    // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Determine initial role
-    // Only allow "customer" or "owner" for public registration
-    // Prevent "admin", "manager", "waiter", "kitchen" from being self-assigned
     const allowedRoles = ["customer", "owner"];
     const requestedRole = role && allowedRoles.includes(role) ? role : "customer";
     const initialRoles = [requestedRole];
 
-    // Create new user
     const newUser = new User({
       name,
       email,
@@ -72,10 +64,7 @@ export const registerUser = async (req, res) => {
 
     await newUser.save();
 
-    // Generate token
     const token = generateToken(newUser._id, newUser.roles);
-
-    // Set cookie
     setTokenCookie(res, token);
 
     res.status(201).json({
@@ -89,9 +78,7 @@ export const registerUser = async (req, res) => {
     });
   } catch (error) {
     logger.error("Error in registerUser:", error.message);
-    res
-      .status(500)
-      .json({ message: "Error during registration", error: error.message });
+    res.status(500).json({ message: "Error during registration", error: error.message });
   }
 };
 
@@ -100,7 +87,6 @@ export const loginUser = async (req, res) => {
   try {
     const { email, password, role } = req.body;
 
-    // Validate input
     if (!email || !password) {
       return res.status(400).json({ message: "Email and password are required" });
     }
@@ -113,24 +99,20 @@ export const loginUser = async (req, res) => {
       return res.status(400).json({ message: "Password must be at least 6 characters long" });
     }
 
-    // Find user in database and include password for verification
     const user = await User.findOne({ email }).select('+password');
     if (!user) {
       return res.status(400).json({ message: "Invalid credentials" });
     }
 
-    // Verify password login permission
     const isOwnerOrCustomer = user.roles.some(r => ["owner", "customer", "admin"].includes(r));
     const isStaffOnly = user.roles.some(r => ["waiter", "kitchen", "manager"].includes(r)) && !isOwnerOrCustomer;
 
-    // Staff accounts follow the owner's choice strictly
     if (isStaffOnly && user.authProvider !== "local") {
       return res.status(400).json({
         message: "This staff account is configured for Google login only. Please use the 'Continue with Google' button."
       });
     }
 
-    // Generic check: if there's no password (pure Google account), they must use Google
     if (!user.password) {
       return res.status(400).json({
         message: "This account does not have a password set. Please use 'Continue with Google'."
@@ -142,26 +124,19 @@ export const loginUser = async (req, res) => {
       return res.status(400).json({ message: "Invalid credentials" });
     }
 
-    // Handle Role Logic
     if (role) {
       if (role === 'owner') {
-        // Only allow upgrade if user is strictly a customer (no staff roles)
         const hasStaffRoles = user.roles.some(r => ['manager', 'waiter', 'kitchen', 'staff', 'admin'].includes(r));
-
         if (hasStaffRoles) {
           return res.status(403).json({
             message: "Staff members cannot login as owners with the same account. Please use a separate account."
           });
         }
-
-        // Allow auto-upgrade for pure customers
         if (!user.roles.includes('owner')) {
           user.roles.push('owner');
           await user.save();
         }
-      }
-      // For staff roles, we just check if they have it.
-      else if (['waiter', 'kitchen', 'manager', 'staff'].includes(role)) {
+      } else if (['waiter', 'kitchen', 'manager', 'staff'].includes(role)) {
         if (!user.roles.includes(role)) {
           return res.status(403).json({
             message: `Access denied. You are not authorized as a ${role}.`
@@ -170,10 +145,7 @@ export const loginUser = async (req, res) => {
       }
     }
 
-    // Generate token with (potentially updated) role
     const token = generateToken(user._id, user.roles);
-
-    // Set cookie
     setTokenCookie(res, token);
 
     res.status(200).json({
@@ -197,8 +169,8 @@ export const logoutUser = (req, res) => {
   try {
     res.cookie("jwt", "", {
       httpOnly: true,
-      secure: true,
-      sameSite: "none",
+      secure: process.env.NODE_ENV === "production",
+      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
       expires: new Date(0),
     });
     res.status(200).json({ message: "Logout successful" });
@@ -214,11 +186,10 @@ export const getCurrentUser = async (req, res) => {
     res.status(200).json({ message: "User data retrieved", user: req.user });
   } catch (error) {
     logger.error("Error in getCurrentUser:", error.message);
-    res
-      .status(500)
-      .json({ message: "Error retrieving user", error: error.message });
+    res.status(500).json({ message: "Error retrieving user", error: error.message });
   }
 };
+
 // Google Auth Callback handler
 export const googleAuthCallback = async (req, res) => {
   try {
@@ -226,17 +197,12 @@ export const googleAuthCallback = async (req, res) => {
       return res.redirect(`${process.env.FRONTEND_URL || "http://localhost:3000"}/login?error=Google auth failed`);
     }
 
-    // Generate token
     const token = generateToken(req.user._id, req.user.roles);
-
-    // Set cookie
     setTokenCookie(res, token);
 
-    // Default redirect based on role
     const isStaffRole = req.user.roles.some(role => ["owner", "manager", "waiter", "kitchen", "admin"].includes(role));
     let redirectPath = isStaffRole ? "/business" : "/";
 
-    // Override if state is provided
     if (req.query.state) {
       try {
         const state = JSON.parse(Buffer.from(req.query.state, "base64").toString());
@@ -250,7 +216,6 @@ export const googleAuthCallback = async (req, res) => {
       }
     }
 
-    // Redirect to frontend
     res.redirect(`${process.env.FRONTEND_URL || "http://localhost:3000"}${redirectPath}`);
   } catch (error) {
     logger.error("Error in googleAuthCallback:", error.message);
